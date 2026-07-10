@@ -1,0 +1,289 @@
+name: Codex codebase maintenance
+
+on:
+  # Запуск после каждого push в основную ветку.
+  # Один push с несколькими commits создаст один запуск.
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+
+  # Три запуска в день по амстердамскому времени.
+  schedule:
+    - cron: "0 8,14,20 * * *"
+      timezone: "Europe/Amsterdam"
+
+  # Возможность ручного запуска.
+  workflow_dispatch:
+
+concurrency:
+  group: codex-maintenance-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  generate-patch:
+    name: Generate maintenance patch
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+      actions: read
+      security-events: read
+
+    outputs:
+      has_changes: ${{ steps.patch.outputs.has_changes }}
+      base_sha: ${{ steps.base.outputs.base_sha }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record base commit
+        id: base
+        shell: bash
+        run: |
+          echo "base_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Configure GitHub MCP
+        shell: bash
+        env:
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$CODEX_HOME"
+
+          cat > "$CODEX_HOME/config.toml" <<'TOML'
+          [mcp_servers.github]
+          command = "docker"
+          args = [
+            "run",
+            "-i",
+            "--rm",
+            "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
+            "-e", "GITHUB_TOOLSETS",
+            "-e", "GITHUB_READ_ONLY",
+            "-e", "GITHUB_LOCKDOWN_MODE",
+            "ghcr.io/github/github-mcp-server:v1.5.0"
+          ]
+
+          env_vars = [
+            "GITHUB_PERSONAL_ACCESS_TOKEN",
+            "GITHUB_TOOLSETS",
+            "GITHUB_READ_ONLY",
+            "GITHUB_LOCKDOWN_MODE"
+          ]
+
+          startup_timeout_sec = 30
+          tool_timeout_sec = 120
+          required = true
+          default_tools_approval_mode = "auto"
+          TOML
+
+      - name: Run Codex maintenance agent
+        id: codex
+        uses: openai/codex-action@v1
+        env:
+          # GitHub MCP работает только на чтение.
+          GITHUB_PERSONAL_ACCESS_TOKEN: ${{ github.token }}
+          GITHUB_TOOLSETS: >-
+            context,repos,issues,pull_requests,actions,
+            code_quality,code_security
+          GITHUB_READ_ONLY: "1"
+          GITHUB_LOCKDOWN_MODE: "1"
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .github/codex/prompts/maintenance.md
+
+          # Используйте эту модель, если она доступна API-проекту.
+          model: gpt-5.6-sol
+          effort: high
+
+          sandbox: workspace-write
+          safety-strategy: drop-sudo
+          codex-home: ${{ runner.temp }}/codex-home
+          codex-args: '["--ephemeral"]'
+          output-file: codex-report.md
+
+      - name: Export generated patch
+        id: patch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Добавляет новые, ещё не отслеживаемые файлы в git diff.
+          git add -N .
+
+          if [[ -z "$(git status --porcelain)" ]]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git diff --binary --full-index > codex.patch
+
+          changed_files="$(git status --porcelain | wc -l | tr -d ' ')"
+          patch_size="$(wc -c < codex.patch | tr -d ' ')"
+
+          if (( changed_files > 10 )); then
+            echo "Codex changed too many files: $changed_files"
+            exit 1
+          fi
+
+          if (( patch_size > 500000 )); then
+            echo "Codex patch is too large: $patch_size bytes"
+            exit 1
+          fi
+
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload patch
+        if: steps.patch.outputs.has_changes == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-maintenance-patch
+          path: |
+            codex.patch
+            codex-report.md
+          if-no-files-found: error
+          retention-days: 7
+
+  validate-patch:
+    name: Validate maintenance patch
+    needs: generate-patch
+    if: needs.generate-patch.outputs.has_changes == 'true'
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # В этом job нет OpenAI key и write-токена.
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout exact base commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.generate-patch.outputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download patch
+        uses: actions/download-artifact@v4
+        with:
+          name: codex-maintenance-patch
+          path: .
+
+      - name: Apply patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check codex.patch
+          git apply codex.patch
+
+      - name: Block sensitive changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          blocked="$(
+            git diff --name-only HEAD |
+              grep -E '^(\.github/workflows/|\.github/actions/|\.codex/)' ||
+              true
+          )"
+
+          if [[ -n "$blocked" ]]; then
+            echo "Codex attempted to modify protected files:"
+            echo "$blocked"
+            exit 1
+          fi
+
+      - name: Run project validation
+        shell: bash
+        run: ./scripts/ci-verify.sh
+
+  publish-pr:
+    name: Publish maintenance PR
+    needs:
+      - generate-patch
+      - validate-patch
+
+    if: needs.generate-patch.outputs.has_changes == 'true'
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BASE_BRANCH: ${{ github.event.repository.default_branch }}
+
+    steps:
+      - name: Checkout exact base commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.generate-patch.outputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download patch
+        uses: actions/download-artifact@v4
+        with:
+          name: codex-maintenance-patch
+          path: .
+
+      - name: Apply validated patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check codex.patch
+          git apply codex.patch
+
+      - name: Create branch and Pull Request
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          branch="automation/codex-maintenance-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git switch -c "$branch"
+          git add -A
+          git commit -m "chore: apply automated maintenance fixes"
+
+          git push \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/${branch}"
+
+          cat > /tmp/pr-body.md <<EOF
+          ## Automated maintenance
+
+          This Pull Request was generated by the Codex maintenance workflow.
+
+          - Base commit: \`${{ needs.generate-patch.outputs.base_sha }}\`
+          - Trigger: \`${{ github.event_name }}\`
+          - Workflow run: \`${{ github.run_id }}\`
+          - Project validation completed successfully.
+
+          Review and merge this PR manually. Do not enable automatic merging
+          until the workflow has demonstrated stable behavior.
+          EOF
+
+          gh pr create \
+            --base "$BASE_BRANCH" \
+            --head "$branch" \
+            --title "chore: automated codebase maintenance" \
+            --body-file /tmp/pr-body.md
